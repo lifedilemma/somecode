@@ -1,0 +1,58 @@
+import pandas as pd
+import numpy as np
+
+# ----- 1.  SETTINGS  -----
+pairs = [_________]
+lags  = range(1,6)                # test 1- to 5-hour exit horizons
+notional = 1.0                    # fixed 1-unit size
+lookback = 2_000                  # window for correlation scan
+
+# ----- 2.  RETURNS  -----
+rets = np.log(master).diff().dropna()      # 'master' = cleaned price table
+
+# ----- 3.  FIND STRONG LAGGED LINKS (ROLLING)  -----
+def find_links(window):
+    corrs = []
+    for b in pairs:
+        for t in pairs:
+            if b == t: continue
+            for L in lags:
+                c = window[f'px_{b}'].corr(window[f'px_{t}'].shift(-L))
+                corrs.append((abs(c), c, b, t, L))
+    corrs.sort(reverse=True)
+    return corrs[:3]                       # keep top-3 each recalibration
+
+links = find_links(rets.tail(lookback))    # one-off scan; can be refreshed
+
+# ----- 4.  BUILD INSTANT-REACTION SIGNALS  -----
+sig  = pd.DataFrame(0, index=rets.index, 
+                    columns=[f'{b}->{t}@{L}h' for _,_,b,t,L in links])
+pl   = pd.Series(0.0, index=rets.index)
+
+for _, corr, b, t, L in links:
+    tag = f'{b}->{t}@{L}h'
+    
+    # 4.1 ENTRY: whenever base return changes sign
+    entry_cond = np.sign(rets[f'px_{b}']).diff().fillna(0) != 0
+    entry_idx  = rets.index[entry_cond]
+    
+    # 4.2 POSITION DIRECTION right after the move
+    pos_dir = np.sign(rets.loc[entry_idx, f'px_{b}']) * np.sign(corr)
+    
+    for ts, p in zip(entry_idx, pos_dir):
+        exit_ts = ts + pd.Timedelta(hours=L)
+        if exit_ts not in rets.index:         # skip if we overflow the sample
+            continue
+        sig.at[ts, tag]        =  p * notional       # open
+        sig.at[exit_ts, tag]   = -p * notional       # close (offset)
+
+# ----- 5.  P&L ACCUMULATION  -----
+# Forward-fill to maintain open positions
+pos = sig.cumsum()
+pl  = (pos * rets.reindex_like(pos)).sum(axis=1)
+
+# ----- 6.  QUICK PERFORMANCE CHECK  -----
+cum = pl.cumsum()
+print(f"Total P/L        : {cum.iloc[-1]:.4f}")
+print(f"Hourly Sharpe    : {pl.mean()/pl.std():.3f}")
+print(f"Max drawdown     : { (cum - cum.cummax()).min():.4f}")

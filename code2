@@ -1,0 +1,99 @@
+import glob, pandas as pd, numpy as np, matplotlib.pyplot as plt
+from collections import defaultdict
+
+# ----------  PARAMETERS ----------
+ROLL_WIN   = 240          # rolling window size in hours
+CORR_LAG   = 1            # lead of target returns vs. source returns
+THRESH     = 0.003        # 0.3 % absolute move
+TOP_N      = 3            # number of strongest lagged-corr pairs to trade
+MAX_GAP_HR = 12            # ffill at most this many hours
+# ---------------------------------
+
+def load_pair(path, pair):
+    df = pd.read_csv(path, names=['timestamp', pair])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+    df = df.set_index('timestamp')
+    df = df.resample('1H').last()
+    df[pair] = df[pair].ffill(limit=MAX_GAP_HR)
+    return df
+
+# 1) ----- DATA INGESTION -----
+all_csv = glob.glob('data/*.csv')          # adjust path
+pairs   = [f.split('/')[-1][:6] for f in all_csv]   # infer "USDAUD", ...
+dfs     = [load_pair(p, pair) for p, pair in zip(all_csv, pairs)]
+prices  = pd.concat(dfs, axis=1).dropna(how='any')  # strict intersection
+
+# 2) ----- RETURNS -----
+rets = prices.pct_change().dropna()
+
+# 3) ----- LAGGED CORRELATION MATRIX -----
+lead_rets = rets.shift(-CORR_LAG)          # r_(t+1)
+lag_corr  = (
+    pd.concat({'src': rets, 'tgt': lead_rets}, axis=1)
+      .rolling(ROLL_WIN)
+      .corr().loc[:, 'src']
+      .xs('tgt', level=0, axis=1)
+)
+# Take last row for current strengths
+latest_corr = lag_corr.dropna().iloc[-1]
+strongest   = latest_corr.abs().stack().nlargest(TOP_N)
+
+signals = []
+for (src, tgt), rho in strongest.items():
+    sign = np.sign(rho)                    # direction of trade
+    signals.append({'src': src, 'tgt': tgt, 'sign': sign, 'rho': rho})
+
+print("Selected relationships:", signals)
+
+# 4) ----- BACKTEST ENGINE -----
+positions = defaultdict(float)             # units per pair
+pnl_track = defaultdict(float)
+equity    = []
+
+for t in range(ROLL_WIN + CORR_LAG, len(rets)):
+    ts   = rets.index[t]
+    hour = ts
+
+    # ---- trigger evaluation ----
+    for rule in signals:
+        src = rule['src']; tgt = rule['tgt']; sgn = rule['sign']
+        move = abs(rets.iloc[t][src])
+        if move >= THRESH:
+            positions[tgt] += -sgn          # short if corr positive & src up
+            rule.setdefault('queue', []).append((tgt, sgn, hour + pd.Timedelta(hours=CORR_LAG)))
+
+    # ---- unwind matured legs ----
+    for rule in signals:
+        q = rule.get('queue', [])
+        matured = [item for item in q if item[2] <= hour]
+        for tgt, sgn, _ in matured:
+            positions[tgt] -= -sgn          # close one unit
+        rule['queue'] = [item for item in q if item[2] > hour]
+
+    # ---- mark-to-market ----
+    curr_pnl = 0
+    for pair, units in positions.items():
+        curr_ret  = rets.loc[hour, pair] if pair in rets.columns else 0
+        pnl_track[pair] += units * curr_ret
+        curr_pnl += units * curr_ret
+    equity.append(curr_pnl)
+
+# 5) ----- VISUALISATION -----
+equity_curve = pd.Series(equity, index=rets.index[ROLL_WIN+CORR_LAG:])
+pnl_df = pd.Series(pnl_track)
+
+fig, ax = plt.subplots(2,1, figsize=(12,8), sharex=False)
+
+# Equity curve
+ax[0].plot(equity_curve.cumsum(), label='Strategy NAV')
+ax[0].set_title('Equity Curve')
+ax[0].set_ylabel('Cumulative Return')
+ax[0].legend(); ax[0].grid(True)
+
+# Pair-wise PnL
+pairs_sorted = pnl_df.sort_values()
+ax[1].barh(pairs_sorted.index, pairs_sorted.values, color='steelblue')
+ax[1].set_title('Cumulative PnL by Currency Pair')
+ax[1].set_xlabel('Return (units)')
+plt.tight_layout()
+plt.show()

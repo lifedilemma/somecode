@@ -27,7 +27,7 @@ for abs_corr, corr, base, target, lag in LAGS:
     #    rolling(...).sum().shift(-(lag-1)) aligns exit at t+lag-1
     rolling_sum = (
         rets_real[f'px_{target}']
-        .rolling(lag, min_periods=lag)
+        .rolling(lag, min_periods=lag
         .sum()
         .shift(-(lag-1))
     )
@@ -38,3 +38,42 @@ for abs_corr, corr, base, target, lag in LAGS:
     pl += pnl.fillna(0)
 
 cum = pl.cumsum()          # equity curve for dashboards
+
+
+
+
+
+
+
+
+
+
+# prerequisites: rets_real, rets_log, top ([(abs_corr, corr, base, target, lag), ...])
+import numpy as np
+import pandas as pd
+
+THRESH = 0.003          # 0.30 % trigger
+sig     = pd.DataFrame(index=rets_log.index)   # +1 / –1 entry signals
+pl      = pd.Series(0.0, index=rets_log.index)
+
+for _, corr, base, target, lag in top:
+    # 1. trigger flag
+    trig = (rets_real[f'px_{base}'].abs() > THRESH).astype(int)
+
+    # 2. signed entry (+1 long, –1 short)
+    entry = np.sign(rets_real[f'px_{base}']) * np.sign(corr) * trig
+
+    # 3. cumulative position size (overlapping trades stack)
+    stack = entry.cumsum() - entry.cumsum().shift(lag).fillna(0)
+
+    # 4. PnL: position at t times target’s sum of returns over [t, t+L-1]
+    pnl = stack * (
+        rets_real[f'px_{target}']
+        .rolling(lag, min_periods=lag).sum()
+        .shift(-(lag - 1))
+    )
+
+    sig[f'{base}->{target}@{lag}h'] = entry
+    pl += pnl.fillna(0)
+
+cum_equity = pl.cumsum()

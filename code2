@@ -1,0 +1,14 @@
+# Assume you have cleaned DataFrames: master (prices), rets_log, rets_real
+# top: list of (abs_corr, corr, base, target, lag)
+
+sig = pd.DataFrame(index=rets_log.index)
+pl = pd.Series(0.0, index=rets_log.index)
+
+for abs_corr, corr, base, target, lag in top:
+    pos = np.sign(rets_real[f'px_{base}']) * np.sign(corr)
+    # Hold position: sum real returns of target from t to t+lag-1
+    pnl = pos * rets_real[f'px_{target}'].rolling(lag, min_periods=lag).sum().shift(-(lag-1))
+    sig[f'{base}->{target}@{lag}h'] = pos
+    pl += pnl.fillna(0)
+
+cum = pl.cumsum()

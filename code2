@@ -1,14 +1,40 @@
-# Assume you have cleaned DataFrames: master (prices), rets_log, rets_real
-# top: list of (abs_corr, corr, base, target, lag)
+# --------------------------------------------
+# parameters
+# --------------------------------------------
+THRESH = 0.003          # 0.30 % absolute move in the base pair
+LAGS   = top            # list of (abs_corr, corr, base, target, lag) you computed earlier
 
-sig = pd.DataFrame(index=rets_log.index)
-pl = pd.Series(0.0, index=rets_log.index)
+# containers
+sig = pd.DataFrame(index=rets_real.index)          # +1 / -1 / 0  signals
+pl  = pd.Series(0.0,      index=rets_real.index)   # hourly PnL stream
 
-for abs_corr, corr, base, target, lag in top:
-    pos = np.sign(rets_real[f'px_{base}']) * np.sign(corr)
-    # Hold position: sum real returns of target from t to t+lag-1
-    pnl = pos * rets_real[f'px_{target}'].rolling(lag, min_periods=lag).sum().shift(-(lag-1))
+# --------------------------------------------
+# main loop with threshold filter
+# --------------------------------------------
+for abs_corr, corr, base, target, lag in LAGS:
+    
+    # 1. real hourly return of the base pair
+    r_base = rets_real[f'px_{base}']
+    
+    # 2. trigger only if |return| > 0.30 %
+    trigger = (r_base.abs() > THRESH)
+    
+    # 3. direction of the position we will open *immediately*
+    pos = np.sign(r_base) * np.sign(corr)          # long or short
+    pos = pos.where(trigger, 0)                    # zero if no trigger
+    
+    # 4. PnL = position * sum of target real returns over <lag> hours
+    #    rolling(...).sum().shift(-(lag-1)) aligns exit at t+lag-1
+    rolling_sum = (
+        rets_real[f'px_{target}']
+        .rolling(lag, min_periods=lag)
+        .sum()
+        .shift(-(lag-1))
+    )
+    pnl = pos * rolling_sum
+    
+    # 5. store
     sig[f'{base}->{target}@{lag}h'] = pos
     pl += pnl.fillna(0)
 
-cum = pl.cumsum()
+cum = pl.cumsum()          # equity curve for dashboards

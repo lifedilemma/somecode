@@ -1,58 +1,325 @@
 import pandas as pd
 import numpy as np
+from scipy import stats
+import warnings
+warnings.filterwarnings('ignore')
 
-# ----- 1.  SETTINGS  -----
-pairs = [_________]
-lags  = range(1,6)                # test 1- to 5-hour exit horizons
-notional = 1.0                    # fixed 1-unit size
-lookback = 2_000                  # window for correlation scan
-
-# ----- 2.  RETURNS  -----
-rets = np.log(master).diff().dropna()      # 'master' = cleaned price table
-
-# ----- 3.  FIND STRONG LAGGED LINKS (ROLLING)  -----
-def find_links(window):
-    corrs = []
-    for b in pairs:
-        for t in pairs:
-            if b == t: continue
-            for L in lags:
-                c = window[f'px_{b}'].corr(window[f'px_{t}'].shift(-L))
-                corrs.append((abs(c), c, b, t, L))
-    corrs.sort(reverse=True)
-    return corrs[:3]                       # keep top-3 each recalibration
-
-links = find_links(rets.tail(lookback))    # one-off scan; can be refreshed
-
-# ----- 4.  BUILD INSTANT-REACTION SIGNALS  -----
-sig  = pd.DataFrame(0, index=rets.index, 
-                    columns=[f'{b}->{t}@{L}h' for _,_,b,t,L in links])
-pl   = pd.Series(0.0, index=rets.index)
-
-for _, corr, b, t, L in links:
-    tag = f'{b}->{t}@{L}h'
+class CrossCurrencyMomentumTrader:
+    def __init__(self, currency_pairs, lookback_window=168, correlation_window=24, lag_periods=12):
+        """
+        Initialize the momentum trader
+        
+        Parameters:
+        - currency_pairs: list of currency pair names
+        - lookback_window: hours to look back for correlation analysis (default: 1 week)
+        - correlation_window: rolling window for correlation calculation (default: 24 hours)
+        - lag_periods: maximum lag periods to test (default: 12 hours)
+        """
+        self.currency_pairs = currency_pairs
+        self.lookback_window = lookback_window
+        self.correlation_window = correlation_window
+        self.lag_periods = lag_periods
+        self.data = {}
+        self.returns = {}
+        self.correlations = {}
+        self.positions = {pair: 0 for pair in currency_pairs}
+        self.signals = []
+        
+    def load_data(self, file_paths):
+        """Load CSV files for each currency pair"""
+        for pair, path in file_paths.items():
+            df = pd.read_csv(path)
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df = df.set_index('timestamp').sort_index()
+            df = df.rename(columns={'price': pair})
+            self.data[pair] = df
+            
+    def calculate_returns(self):
+        """Calculate simple arithmetic returns for all currency pairs"""
+        for pair in self.currency_pairs:
+            if pair in self.data:
+                # Simple arithmetic returns as mentioned in research[16]
+                self.returns[pair] = self.data[pair][pair].pct_change()
+                
+    def handle_missing_data(self):
+        """Handle missing data for currencies not traded 24/7"""
+        # Create a combined dataframe with all timestamps
+        all_timestamps = set()
+        for pair in self.currency_pairs:
+            if pair in self.data:
+                all_timestamps.update(self.data[pair].index)
+        
+        full_index = pd.DatetimeIndex(sorted(all_timestamps))
+        
+        # Reindex all series and forward fill missing values
+        for pair in self.currency_pairs:
+            if pair in self.returns:
+                self.returns[pair] = self.returns[pair].reindex(full_index)
+                # Forward fill for non-24/7 currencies, but limit to reasonable gaps
+                self.returns[pair] = self.returns[pair].fillna(method='ffill', limit=6)
+                # Fill remaining with 0 (no movement assumption)
+                self.returns[pair] = self.returns[pair].fillna(0)
     
-    # 4.1 ENTRY: whenever base return changes sign
-    entry_cond = np.sign(rets[f'px_{b}']).diff().fillna(0) != 0
-    entry_idx  = rets.index[entry_cond]
+    def calculate_lagged_correlations(self):
+        """Calculate rolling lagged correlations between all currency pairs"""
+        correlations = {}
+        
+        for i, pair1 in enumerate(self.currency_pairs):
+            for j, pair2 in enumerate(self.currency_pairs):
+                if i != j and pair1 in self.returns and pair2 in self.returns:
+                    pair_key = f"{pair1}_{pair2}"
+                    correlations[pair_key] = {}
+                    
+                    # Calculate correlations for different lag periods
+                    for lag in range(1, self.lag_periods + 1):
+                        lagged_corr = []
+                        
+                        # Rolling lagged correlation calculation
+                        for window_start in range(len(self.returns[pair1]) - self.correlation_window):
+                            window_end = window_start + self.correlation_window
+                            
+                            if window_end + lag < len(self.returns[pair2]):
+                                # Get current window for pair1 and lagged window for pair2
+                                returns1 = self.returns[pair1].iloc[window_start:window_end]
+                                returns2 = self.returns[pair2].iloc[window_start + lag:window_end + lag]
+                                
+                                # Remove NaN values for correlation calculation
+                                valid_data = pd.concat([returns1, returns2], axis=1).dropna()
+                                
+                                if len(valid_data) > 10:  # Minimum data points for meaningful correlation
+                                    corr = valid_data.iloc[:, 0].corr(valid_data.iloc[:, 1])
+                                    if not np.isnan(corr):
+                                        lagged_corr.append(abs(corr))  # Use absolute correlation
+                        
+                        if lagged_corr:
+                            correlations[pair_key][lag] = {
+                                'mean_correlation': np.mean(lagged_corr),
+                                'std_correlation': np.std(lagged_corr),
+                                'max_correlation': np.max(lagged_corr)
+                            }
+        
+        self.correlations = correlations
     
-    # 4.2 POSITION DIRECTION right after the move
-    pos_dir = np.sign(rets.loc[entry_idx, f'px_{b}']) * np.sign(corr)
+    def identify_strongest_signals(self, min_correlation=0.3, significance_threshold=0.05):
+        """Identify the strongest lagged correlation signals"""
+        strong_signals = []
+        
+        for pair_combination, lag_data in self.correlations.items():
+            pair1, pair2 = pair_combination.split('_')
+            
+            for lag, stats_data in lag_data.items():
+                mean_corr = stats_data['mean_correlation']
+                
+                # Filter for strong correlations above threshold
+                if mean_corr > min_correlation:
+                    # Determine signal direction based on correlation pattern
+                    # For currency momentum, we typically want negative correlation 
+                    # (when one goes up, short the other)
+                    signal_strength = mean_corr * (1 / stats_data['std_correlation']) if stats_data['std_correlation'] > 0 else 0
+                    
+                    strong_signals.append({
+                        'leader': pair1,
+                        'follower': pair2,
+                        'lag': lag,
+                        'correlation': mean_corr,
+                        'signal_strength': signal_strength,
+                        'direction': 'opposite'  # Momentum strategy typically uses opposite direction
+                    })
+        
+        # Sort by signal strength and return top signals
+        strong_signals.sort(key=lambda x: x['signal_strength'], reverse=True)
+        self.signals = strong_signals[:10]  # Keep top 10 signals
+        
+        return self.signals
     
-    for ts, p in zip(entry_idx, pos_dir):
-        exit_ts = ts + pd.Timedelta(hours=L)
-        if exit_ts not in rets.index:         # skip if we overflow the sample
-            continue
-        sig.at[ts, tag]        =  p * notional       # open
-        sig.at[exit_ts, tag]   = -p * notional       # close (offset)
+    def calculate_position_size(self, trigger_magnitude, base_size=1.0):
+        """Calculate position size based on trigger magnitude"""
+        # Scale position size based on how much the trigger exceeds 0.3%
+        excess_magnitude = trigger_magnitude - 0.003
+        position_multiplier = 1.0 + (excess_magnitude / 0.003) * 0.5  # 50% increase per 0.3% excess
+        return min(base_size * position_multiplier, 3.0)  # Cap at 3x base size
+    
+    def check_triggers_and_trade(self, current_time, trigger_threshold=0.003):
+        """Check for trigger conditions and execute trades"""
+        trades_executed = []
+        
+        if current_time not in self.returns[self.currency_pairs[0]].index:
+            return trades_executed
+        
+        current_idx = self.returns[self.currency_pairs[0]].index.get_loc(current_time)
+        
+        # Check each signal for trigger conditions
+        for signal in self.signals:
+            leader = signal['leader']
+            follower = signal['follower']
+            lag = signal['lag']
+            
+            if leader in self.returns and follower in self.returns:
+                # Get current return for leader
+                if current_idx < len(self.returns[leader]):
+                    leader_return = self.returns[leader].iloc[current_idx]
+                    
+                    # Check if trigger condition is met (>0.3% movement)
+                    if abs(leader_return) > trigger_threshold:
+                        # Calculate position size based on magnitude
+                        position_size = self.calculate_position_size(abs(leader_return))
+                        
+                        # Determine trade direction
+                        if signal['direction'] == 'opposite':
+                            # If leader goes up, short follower (and vice versa)
+                            trade_direction = -1 if leader_return > 0 else 1
+                        else:
+                            # Same direction
+                            trade_direction = 1 if leader_return > 0 else -1
+                        
+                        # Execute trade
+                        trade_size = trade_direction * position_size
+                        self.positions[follower] += trade_size
+                        
+                        trade_info = {
+                            'timestamp': current_time,
+                            'leader': leader,
+                            'follower': follower,
+                            'leader_return': leader_return,
+                            'trade_direction': trade_direction,
+                            'position_size': position_size,
+                            'new_position': self.positions[follower],
+                            'lag': lag,
+                            'unwind_time': current_time + pd.Timedelta(hours=lag)
+                        }
+                        
+                        trades_executed.append(trade_info)
+        
+        return trades_executed
+    
+    def unwind_positions(self, current_time, trade_history):
+        """Unwind positions after lag period expires"""
+        unwound_trades = []
+        
+        for trade in trade_history:
+            if current_time >= trade['unwind_time']:
+                # Unwind the position
+                follower = trade['follower']
+                unwind_size = -trade['trade_direction'] * trade['position_size']
+                self.positions[follower] += unwind_size
+                
+                unwound_trade = {
+                    'timestamp': current_time,
+                    'original_trade': trade,
+                    'unwind_size': unwind_size,
+                    'final_position': self.positions[follower]
+                }
+                
+                unwound_trades.append(unwound_trade)
+        
+        return unwound_trades
+    
+    def run_backtest(self, start_date=None, end_date=None):
+        """Run complete backtest of the momentum strategy"""
+        # Prepare data
+        self.calculate_returns()
+        self.handle_missing_data()
+        self.calculate_lagged_correlations()
+        signals = self.identify_strongest_signals()
+        
+        print(f"Found {len(signals)} strong momentum signals:")
+        for i, signal in enumerate(signals[:5]):  # Show top 5
+            print(f"{i+1}. {signal['leader']} -> {signal['follower']} "
+                  f"(lag: {signal['lag']}h, correlation: {signal['correlation']:.3f})")
+        
+        # Get date range
+        all_dates = self.returns[self.currency_pairs[0]].index
+        if start_date:
+            all_dates = all_dates[all_dates >= start_date]
+        if end_date:
+            all_dates = all_dates[all_dates <= end_date]
+        
+        trade_history = []
+        active_trades = []
+        
+        # Run through each timestamp
+        for current_time in all_dates:
+            # Check for new triggers and execute trades
+            new_trades = self.check_triggers_and_trade(current_time)
+            active_trades.extend(new_trades)
+            trade_history.extend(new_trades)
+            
+            # Unwind expired positions
+            unwound_trades = self.unwind_positions(current_time, active_trades)
+            
+            # Remove unwound trades from active list
+            active_trades = [trade for trade in active_trades 
+                           if current_time < trade['unwind_time']]
+        
+        return trade_history, signals
+    
+    def generate_report(self, trade_history):
+        """Generate trading performance report"""
+        if not trade_history:
+            print("No trades executed during backtest period.")
+            return
+        
+        trade_df = pd.DataFrame(trade_history)
+        
+        print("\n=== TRADING PERFORMANCE REPORT ===")
+        print(f"Total trades executed: {len(trade_history)}")
+        print(f"Currency pairs traded: {trade_df['follower'].nunique()}")
+        print(f"Average position size: {trade_df['position_size'].mean():.2f}")
+        print(f"Max position size: {trade_df['position_size'].max():.2f}")
+        
+        # Position summary
+        print("\n=== FINAL POSITIONS ===")
+        for pair, position in self.positions.items():
+            if abs(position) > 0.01:  # Only show significant positions
+                print(f"{pair}: {position:.3f}")
+        
+        # Trade frequency by pair
+        print("\n=== TRADE FREQUENCY BY PAIR ===")
+        pair_trades = trade_df['follower'].value_counts()
+        for pair, count in pair_trades.items():
+            print(f"{pair}: {count} trades")
 
-# ----- 5.  P&L ACCUMULATION  -----
-# Forward-fill to maintain open positions
-pos = sig.cumsum()
-pl  = (pos * rets.reindex_like(pos)).sum(axis=1)
+# Example usage
+def main():
+    """Example implementation"""
+    
+    # Define currency pairs
+    currency_pairs = ['USDAUD', 'USDKRW', 'USDTWD', 'USDTHB', 'USDINR', 'USDJPY', 'USDHKD']
+    
+    # Initialize trader
+    trader = CrossCurrencyMomentumTrader(
+        currency_pairs=currency_pairs,
+        lookback_window=168,  # 1 week
+        correlation_window=24,  # 1 day rolling window
+        lag_periods=12  # Test up to 12 hour lags
+    )
+    
+    # Example file paths (adjust as needed)
+    file_paths = {
+        'USDAUD': 'usdaud_hourly.csv',
+        'USDKRW': 'usdkrw_hourly.csv',
+        'USDTWD': 'usdtwd_hourly.csv',
+        'USDTHB': 'usdthb_hourly.csv',
+        'USDINR': 'usdinr_hourly.csv',
+        'USDJPY': 'usdjpy_hourly.csv',
+        'USDHKD': 'usdhkd_hourly.csv'
+    }
+    
+    try:
+        # Load data
+        trader.load_data(file_paths)
+        
+        # Run backtest
+        trade_history, signals = trader.run_backtest()
+        
+        # Generate report
+        trader.generate_report(trade_history)
+        
+    except FileNotFoundError as e:
+        print(f"Error loading data files: {e}")
+        print("Please ensure CSV files exist with columns: 'timestamp', 'price'")
+    
+    return trader
 
-# ----- 6.  QUICK PERFORMANCE CHECK  -----
-cum = pl.cumsum()
-print(f"Total P/L        : {cum.iloc[-1]:.4f}")
-print(f"Hourly Sharpe    : {pl.mean()/pl.std():.3f}")
-print(f"Max drawdown     : { (cum - cum.cummax()).min():.4f}")
+if __name__ == "__main__":
+    trader = main()
